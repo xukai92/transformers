@@ -133,6 +133,9 @@ class MixtralConfig(PretrainedConfig):
         output_router_logits=False,
         router_aux_loss_coef=0.001,
         router_jitter_noise=0.0,
+        use_global_router=False,
+        global_as_init=False,
+        router_hidden_layers=0,
         markovian_order=0,
         **kwargs,
     ):
@@ -161,6 +164,9 @@ class MixtralConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.router_jitter_noise = router_jitter_noise
+        self.use_global_router = use_global_router
+        self.global_as_init = global_as_init
+        self.router_hidden_layers = router_hidden_layers
         self.markovian_order = markovian_order
         super().__init__(
             pad_token_id=pad_token_id,

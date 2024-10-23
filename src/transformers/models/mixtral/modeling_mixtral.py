@@ -678,6 +678,63 @@ class MixtralBlockSparseTop2MLP(nn.Module):
         return current_hidden_states
 
 
+class MLPRouter(nn.Module):
+    """router module that maps hidden states to expert weights using an MLP"""
+    def __init__(self, config: MixtralConfig):
+        super().__init__()
+        self.hidden_dim = config.hidden_size
+        self.ffn_dim = config.intermediate_size
+        self.num_experts = config.num_local_experts
+        self.router_hidden_layers = config.router_hidden_layers
+        self.markovian_order = config.markovian_order
+        
+        input_dim = self.hidden_dim + self.markovian_order * self.num_experts
+
+        if self.router_hidden_layers == 0:
+            self.gate = nn.Linear(input_dim, self.num_experts, bias=False)
+        else:
+            gate_layers = []
+            # first layer from input dim to ffn_dim
+            gate_layers.append(nn.Linear(input_dim, self.ffn_dim))
+            gate_layers.append(nn.ReLU())
+            # hidden layers
+            for _ in range(self.router_hidden_layers - 1):
+                gate_layers.append(nn.Linear(self.ffn_dim, self.ffn_dim))
+                gate_layers.append(nn.ReLU())
+            # final layer to num_experts
+            gate_layers.append(nn.Linear(self.ffn_dim, self.num_experts))
+            self.gate = nn.Sequential(*gate_layers)
+
+    def forward(self, hidden_states: torch.Tensor, previous_router_logits_list: List[torch.Tensor]) -> torch.Tensor:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        router_input = torch.cat([hidden_states] + previous_router_logits_list, dim=-1)
+        return self.gate(router_input)
+
+class AttentionRouter(nn.Module):
+    """
+    Router that uses attention to compute routing logits.
+    """
+    def __init__(self, config: MixtralConfig):
+        super().__init__()
+        self.attention = MixtralAttention(config)
+        self.embed_tokens = nn.Linear(config.num_local_experts, config.hidden_size, bias=False)
+        self.router_out = nn.Linear(config.hidden_size, config.num_local_experts, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor, previous_router_logits_list: Optional[List[torch.Tensor]] = None):
+        # process previous router logits if provided
+        if previous_router_logits_list is not None:
+            # embed each previous router logits and append to hidden states
+            for prev_logits in previous_router_logits_list:
+                embedded_logits = self.embed_tokens(prev_logits)  # convert logits to embeddings
+                hidden_states = torch.cat([hidden_states, embedded_logits], dim=1)  # append to sequence
+
+        router_hidden_states, _, _ = self.attention(hidden_states=hidden_states)
+        routing_logits = self.router_out(
+            router_hidden_states.sum(dim=1) # batch_size, sequence_length, hidden_dim -> batch_size, hidden_dim
+        )
+        return routing_logits
+
 class MixtralSparseMoeBlock(nn.Module):
     """
     This implementation is
@@ -696,22 +753,27 @@ class MixtralSparseMoeBlock(nn.Module):
         self.ffn_dim = config.intermediate_size
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
+        self.router_hidden_layers = config.router_hidden_layers
         self.markovian_order = config.markovian_order
 
         # gating
-        self.gate = nn.Linear(self.hidden_dim + self.markovian_order * self.num_experts, self.num_experts, bias=False)
+        self.gate = MLPRouter(config)
 
         self.experts = nn.ModuleList([MixtralBlockSparseTop2MLP(config) for _ in range(self.num_experts)])
 
         # Jitter parameters
         self.jitter_noise = config.router_jitter_noise
 
-    def forward(self, hidden_states: torch.Tensor, previous_router_logits_list: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            routing_logits: Optional[torch.Tensor] = None,
+            previous_router_logits_list: Optional[List[torch.Tensor]] = None,
+        ) -> torch.Tensor:
         """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         if self.training and self.jitter_noise > 0:
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
-        hidden_states = hidden_states.view(-1, hidden_dim)
 
         # prepare previous router logits
         if previous_router_logits_list is None:
@@ -724,11 +786,11 @@ class MixtralSparseMoeBlock(nn.Module):
         else:
             previous_router_logits_list = previous_router_logits_list[-self.markovian_order:]
 
-        # concatenate previous router logits with hidden states
-        router_input = torch.cat([hidden_states] + previous_router_logits_list, dim=-1)
-
         # router_logits: (batch * sequence_length, n_experts)
-        router_logits = self.gate(router_input)
+        if routing_logits is None:
+            router_logits = self.gate(hidden_states, previous_router_logits_list)
+        else:
+            router_logits = routing_logits
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
@@ -743,6 +805,9 @@ class MixtralSparseMoeBlock(nn.Module):
         # One hot encode the selected experts to create an expert mask
         # this will be used to easily index which expert is going to be sollicitated
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+        # reshape hidden states for expert computation
+        hidden_states = hidden_states.view(-1, hidden_dim)
 
         # Loop over all available experts in the model and perform the computation on each expert
         for expert_idx in range(self.num_experts):
@@ -783,6 +848,7 @@ class MixtralDecoderLayer(nn.Module):
         output_router_logits: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        routing_logits: Optional[torch.Tensor] = None,
         previous_router_logits_list: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
@@ -827,7 +893,11 @@ class MixtralDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, router_logits = self.block_sparse_moe(hidden_states, previous_router_logits_list)
+        hidden_states, router_logits = self.block_sparse_moe(
+            hidden_states,
+            routing_logits=routing_logits,
+            previous_router_logits_list=previous_router_logits_list,
+        )
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -980,6 +1050,12 @@ class MixtralModel(MixtralPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.use_global_router = config.use_global_router
+        self.global_as_init = config.global_as_init
+        if self.use_global_router:
+            self.global_router = AttentionRouter(config)
+        else:
+            self.global_router = None
         self.layers = nn.ModuleList(
             [MixtralDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -1011,6 +1087,7 @@ class MixtralModel(MixtralPreTrainedModel):
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        global_routing_logits: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, MoeModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_router_logits = (
@@ -1067,9 +1144,19 @@ class MixtralModel(MixtralPreTrainedModel):
         all_router_logits = () if output_router_logits else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        # only run global router if `global_routing_logits` not provided
+        if self.global_router and global_routing_logits is None:
+            global_routing_logits = self.global_router(hidden_states)
+
+        for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+
+            # only pass global routing logits to first layer if global_as_init is True
+            layer_routing_logits = None
+            if global_routing_logits is not None:
+                if not self.global_as_init or idx == 0:
+                    layer_routing_logits = global_routing_logits
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -1082,6 +1169,7 @@ class MixtralModel(MixtralPreTrainedModel):
                     output_router_logits,
                     use_cache,
                     cache_position,
+                    layer_routing_logits,
                     all_router_logits,
                 )
             else:
@@ -1094,6 +1182,7 @@ class MixtralModel(MixtralPreTrainedModel):
                     output_router_logits=output_router_logits,
                     use_cache=use_cache,
                     cache_position=cache_position,
+                    routing_logits=layer_routing_logits,
                     previous_router_logits_list=all_router_logits,
                 )
 
