@@ -677,7 +677,6 @@ class MixtralBlockSparseTop2MLP(nn.Module):
         current_hidden_states = self.w2(current_hidden_states)
         return current_hidden_states
 
-
 class MLPRouter(nn.Module):
     """router module that maps hidden states to expert weights using an MLP"""
     def __init__(self, config: MixtralConfig):
@@ -695,14 +694,14 @@ class MLPRouter(nn.Module):
         else:
             gate_layers = []
             # first layer from input dim to ffn_dim
-            gate_layers.append(nn.Linear(input_dim, self.ffn_dim))
+            gate_layers.append(nn.Linear(input_dim, self.ffn_dim, bias=False))
             gate_layers.append(nn.ReLU())
             # hidden layers
             for _ in range(self.router_hidden_layers - 1):
-                gate_layers.append(nn.Linear(self.ffn_dim, self.ffn_dim))
+                gate_layers.append(nn.Linear(self.ffn_dim, self.ffn_dim, bias=False))
                 gate_layers.append(nn.ReLU())
             # final layer to num_experts
-            gate_layers.append(nn.Linear(self.ffn_dim, self.num_experts))
+            gate_layers.append(nn.Linear(self.ffn_dim, self.num_experts, bias=False))
             self.gate = nn.Sequential(*gate_layers)
 
     def forward(self, hidden_states: torch.Tensor, previous_router_logits_list: List[torch.Tensor]) -> torch.Tensor:
@@ -735,6 +734,96 @@ class AttentionRouter(nn.Module):
         )
         return routing_logits
 
+class MixtralBlockSparseTop2MLPExperts(nn.Module):
+    def __init__(self, config: MixtralConfig):
+        super().__init__()
+        self.num_experts = config.num_local_experts
+        self.experts = nn.ModuleList([MixtralBlockSparseTop2MLP(config) for _ in range(self.num_experts)])
+
+    def forward(self, hidden_states, routing_weights, selected_experts):
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        # One hot encode the selected experts to create an expert mask
+        # this will be used to easily index which expert is going to be sollicitated
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+        # reshape hidden states for expert computation
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # Loop over all available experts in the model and perform the computation on each expert
+        for expert_idx in range(self.num_experts):
+            expert_layer = self.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx])
+
+            # Index the correct hidden states and compute the expert hidden state for
+            # the current expert. We need to make sure to multiply the output hidden
+            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+
+            # However `index_add_` only support torch tensors for indexing so we'll use
+            # the `top_x` tensor here.
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+        
+        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
+class MixtralBlockSparseTop2MLPLoRAExperts(nn.Module):
+    def __init__(self, config: MixtralConfig):
+        super().__init__()
+        self.ffn_dim = config.intermediate_size
+        self.hidden_dim = config.hidden_size
+        self.num_experts = config.num_local_experts
+        self.lora_rank = config.lora_rank
+
+        self.w1 = nn.ModuleList([nn.Linear(self.hidden_dim, self.ffn_dim, bias=False) for _ in range(self.num_experts)])
+        self.w2 = nn.ModuleList([nn.Linear(self.ffn_dim, self.hidden_dim, bias=False) for _ in range(self.num_experts)])
+        self.w3 = nn.ModuleList([nn.Linear(self.hidden_dim, self.ffn_dim, bias=False) for _ in range(self.num_experts)])
+
+        self.lora_A = nn.ParameterList([nn.Parameter(torch.zeros(self.lora_rank, self.hidden_dim)) for _ in range(self.num_experts * 3)])
+        self.lora_B = nn.ParameterList([nn.Parameter(torch.zeros(self.ffn_dim, self.lora_rank)) for _ in range(self.num_experts * 2)])
+        self.lora_B.extend([nn.Parameter(torch.zeros(self.hidden_dim, self.lora_rank)) for _ in range(self.num_experts)])
+
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, hidden_states, routing_weights, selected_experts):
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        # one hot encode the selected experts to create an expert mask
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+        # reshape hidden states for expert computation
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # loop over all available experts in the model and perform the computation on each expert
+        for expert_idx in range(self.num_experts):
+            idx, top_x = torch.where(expert_mask[expert_idx])
+
+            # index the correct hidden states
+            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+
+            # compute lora weights
+            w1 = self.w1[expert_idx].weight + self.lora_B[expert_idx] @ self.lora_A[expert_idx]
+            w2 = self.w2[expert_idx].weight + self.lora_B[expert_idx + self.num_experts] @ self.lora_A[expert_idx + self.num_experts]
+            w3 = self.w3[expert_idx].weight + self.lora_B[expert_idx + 2*self.num_experts] @ self.lora_A[expert_idx + 2*self.num_experts]
+
+            # compute expert output
+            expert_output = self.act_fn(F.linear(current_state, w1)) * F.linear(current_state, w3)
+            expert_output = F.linear(expert_output, w2)
+
+            # multiply by routing weights
+            current_hidden_states = expert_output * routing_weights[top_x, idx, None]
+
+            # add to final hidden states
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+
+        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
 class MixtralSparseMoeBlock(nn.Module):
     """
     This implementation is
@@ -755,11 +844,15 @@ class MixtralSparseMoeBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.router_hidden_layers = config.router_hidden_layers
         self.markovian_order = config.markovian_order
+        self.router_activation = config.router_activation
 
         # gating
         self.gate = MLPRouter(config)
 
-        self.experts = nn.ModuleList([MixtralBlockSparseTop2MLP(config) for _ in range(self.num_experts)])
+        if config.use_lora_experts:
+            self.experts = MixtralBlockSparseTop2MLPLoRAExperts(config)
+        else:
+            self.experts = MixtralBlockSparseTop2MLPExperts(config)
 
         # Jitter parameters
         self.jitter_noise = config.router_jitter_noise
@@ -792,38 +885,22 @@ class MixtralSparseMoeBlock(nn.Module):
         else:
             router_logits = routing_logits
 
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        if self.router_activation == "softmax":
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        elif self.router_activation == "sigmoid":
+            routing_weights = torch.sigmoid(router_logits)
+            selected_experts = torch.where(routing_weights > 0.5)[1]  # get indices where sigmoid > 0.5
+            # reshape to match expected dimensions
+            routing_weights = routing_weights[torch.arange(routing_weights.size(0))[:, None], selected_experts]
+        else:
+            raise ValueError(f"Unknown router activation: {self.router_activation}")
+
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
 
-        final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-        )
-
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-
-        # reshape hidden states for expert computation
-        hidden_states = hidden_states.view(-1, hidden_dim)
-
-        # Loop over all available experts in the model and perform the computation on each expert
-        for expert_idx in range(self.num_experts):
-            expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx])
-
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
-
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        final_hidden_states = self.experts(hidden_states, routing_weights, selected_experts)
         return final_hidden_states, router_logits
 
 
