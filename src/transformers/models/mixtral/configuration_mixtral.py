@@ -135,10 +135,12 @@ class MixtralConfig(PretrainedConfig):
         router_jitter_noise=0.0,
         use_lora_experts=False,
         router_activation="softmax",
+        gumbel_softmax_tau=0.0,
         use_global_router=False,
-        global_as_init=False,
+        global_as_init_only=False,
         router_hidden_layers=0,
         markovian_order=0,
+        variational=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -168,10 +170,12 @@ class MixtralConfig(PretrainedConfig):
         self.router_jitter_noise = router_jitter_noise
         self.use_lora_experts = use_lora_experts
         self.router_activation = router_activation
+        self.gumbel_softmax_tau = gumbel_softmax_tau
         self.use_global_router = use_global_router
-        self.global_as_init = global_as_init
+        self.global_as_init_only = global_as_init_only
         self.router_hidden_layers = router_hidden_layers
         self.markovian_order = markovian_order
+        self.variational = variational
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

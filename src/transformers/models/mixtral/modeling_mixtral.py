@@ -686,7 +686,7 @@ class MLPRouter(nn.Module):
         self.num_experts = config.num_local_experts
         self.router_hidden_layers = config.router_hidden_layers
         self.markovian_order = config.markovian_order
-        
+        self.variational = config.variational
         input_dim = self.hidden_dim + self.markovian_order * self.num_experts
 
         if self.router_hidden_layers == 0:
@@ -706,6 +706,8 @@ class MLPRouter(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, previous_router_logits_list: List[torch.Tensor]) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
+        if self.variational and self.training:
+            hidden_states = torch.cat([hidden_states[:,1:,:], hidden_states[:,:1,:]], dim=1)
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_input = torch.cat([hidden_states] + previous_router_logits_list, dim=-1)
         return self.gate(router_input)
@@ -719,6 +721,7 @@ class AttentionRouter(nn.Module):
         self.attention = MixtralAttention(config)
         self.embed_tokens = nn.Linear(config.num_local_experts, config.hidden_size, bias=False)
         self.router_out = nn.Linear(config.hidden_size, config.num_local_experts, bias=False)
+        self.variational = config.variational
 
     def forward(self, hidden_states: torch.Tensor, previous_router_logits_list: Optional[List[torch.Tensor]] = None):
         # process previous router logits if provided
@@ -729,8 +732,11 @@ class AttentionRouter(nn.Module):
                 hidden_states = torch.cat([hidden_states, embedded_logits], dim=1)  # append to sequence
 
         router_hidden_states, _, _ = self.attention(hidden_states=hidden_states)
+        batch_size, sequence_length, hidden_dim = router_hidden_states.shape
+        if self.variational and self.training:
+            router_hidden_states = torch.cat([router_hidden_states[:,1:,:], router_hidden_states[:,:1,:]], dim=1)
         routing_logits = self.router_out(
-            router_hidden_states.sum(dim=1) # batch_size, sequence_length, hidden_dim -> batch_size, hidden_dim
+            router_hidden_states.view(-1, hidden_dim)
         )
         return routing_logits
 
@@ -845,8 +851,10 @@ class MixtralSparseMoeBlock(nn.Module):
         self.router_hidden_layers = config.router_hidden_layers
         self.markovian_order = config.markovian_order
         self.router_activation = config.router_activation
+        self.gumbel_softmax_tau = config.gumbel_softmax_tau
 
         # gating
+        # TODO(moe): support attention router
         self.gate = MLPRouter(config)
 
         if config.use_lora_experts:
@@ -873,7 +881,9 @@ class MixtralSparseMoeBlock(nn.Module):
             previous_router_logits_list = []
         
         num_previous = len(previous_router_logits_list)
-        if num_previous < self.markovian_order:
+        if self.markovian_order == 0:
+            previous_router_logits_list = []
+        elif num_previous < self.markovian_order:
             zero_logits = torch.zeros(batch_size * sequence_length, self.num_experts, device=hidden_states.device, dtype=hidden_states.dtype)
             previous_router_logits_list = [zero_logits] * (self.markovian_order - num_previous) + previous_router_logits_list
         else:
@@ -886,14 +896,15 @@ class MixtralSparseMoeBlock(nn.Module):
             router_logits = routing_logits
 
         if self.router_activation == "softmax":
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            if self.gumbel_softmax_tau > 0:
+                routing_weights = F.gumbel_softmax(router_logits, tau=self.gumbel_softmax_tau)
+            else:
+                routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
             routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         elif self.router_activation == "sigmoid":
             routing_weights = torch.sigmoid(router_logits)
-            selected_experts = torch.where(routing_weights > 0.5)[1]  # get indices where sigmoid > 0.5
-            # reshape to match expected dimensions
-            routing_weights = routing_weights[torch.arange(routing_weights.size(0))[:, None], selected_experts]
+            _, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         else:
             raise ValueError(f"Unknown router activation: {self.router_activation}")
 
@@ -1128,7 +1139,7 @@ class MixtralModel(MixtralPreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.use_global_router = config.use_global_router
-        self.global_as_init = config.global_as_init
+        self.global_as_init_only = config.global_as_init_only
         if self.use_global_router:
             self.global_router = AttentionRouter(config)
         else:
@@ -1229,12 +1240,13 @@ class MixtralModel(MixtralPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            # only pass global routing logits to first layer if global_as_init is True
+            # only pass global routing logits to first layer if global_as_init_only is True
             layer_routing_logits = None
             if global_routing_logits is not None:
-                if not self.global_as_init or idx == 0:
+                if not self.global_as_init_only or idx == 0:
                     layer_routing_logits = global_routing_logits
 
+            previous_router_logits_list = None if all_router_logits is None else list(all_router_logits)
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
@@ -1247,7 +1259,7 @@ class MixtralModel(MixtralPreTrainedModel):
                     use_cache,
                     cache_position,
                     layer_routing_logits,
-                    all_router_logits,
+                    previous_router_logits_list,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1260,7 +1272,7 @@ class MixtralModel(MixtralPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     routing_logits=layer_routing_logits,
-                    previous_router_logits_list=all_router_logits,
+                    previous_router_logits_list=previous_router_logits_list,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1365,6 +1377,18 @@ class MixtralModel(MixtralPreTrainedModel):
 
         return causal_mask
 
+def variational_kl_loss_func(gate_logits: torch.Tensor) -> float:
+    loss = 0
+    for logits in gate_logits:
+        logits_prior = logits[:,:-1,:]
+        logits_posterior = logits[:,1:,:]
+        # convert logits to probabilities using softmax and compute KL divergence
+        log_probs_prior = torch.nn.functional.log_softmax(logits_prior, dim=-1)
+        probs_posterior = torch.nn.functional.softmax(logits_posterior, dim=-1)
+        # TODO(moe) use the samples to compute the KL divergence (as they are what 
+        #           actually used for the forward pass to get the prior and posterior)
+        loss += torch.nn.functional.kl_div(log_probs_prior, probs_posterior, reduction='sum')
+    return loss
 
 class MixtralForCausalLM(MixtralPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
@@ -1377,6 +1401,7 @@ class MixtralForCausalLM(MixtralPreTrainedModel):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_local_experts
         self.num_experts_per_tok = config.num_experts_per_tok
+        self.variational = config.variational
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1474,6 +1499,8 @@ class MixtralForCausalLM(MixtralPreTrainedModel):
         )
 
         hidden_states = outputs[0]
+        if self.variational and self.training:
+            hidden_states = hidden_states[:,:-1,:]
         if labels is None and not is_torchdynamo_compiling():
             logger.warning_once(
                 "Starting from v4.46, the `logits` model output will have the same type as the model (except at train time, where it will always be FP32)"
@@ -1499,13 +1526,20 @@ class MixtralForCausalLM(MixtralPreTrainedModel):
 
         aux_loss = None
         if output_router_logits:
-            aux_loss = load_balancing_loss_func(
-                outputs.router_logits if return_dict else outputs[-1],
-                self.num_experts,
-                self.num_experts_per_tok,
-                attention_mask,
-            )
-            if labels is not None:
+            if self.training:
+                gate_logits = outputs.router_logits if return_dict else outputs[-1]
+                if self.variational:
+                    aux_loss = variational_kl_loss_func(
+                        [l.reshape(hidden_states.shape[0], hidden_states.shape[1] + 1, -1) for l in gate_logits]
+                    )
+                else:
+                    aux_loss = load_balancing_loss_func(
+                        gate_logits,
+                        self.num_experts,
+                        self.num_experts_per_tok,
+                        attention_mask,
+                )
+            if labels is not None and aux_loss is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
 
         if not return_dict:
