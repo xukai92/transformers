@@ -712,18 +712,24 @@ class MLPRouter(nn.Module):
         router_input = torch.cat([hidden_states] + previous_router_logits_list, dim=-1)
         return self.gate(router_input)
 
+import copy
+from transformers.models.mistral.modeling_mistral import MistralModel
+
 class AttentionRouter(nn.Module):
     """
     Router that uses attention to compute routing logits.
     """
     def __init__(self, config: MixtralConfig):
         super().__init__()
-        self.attention = MixtralAttention(config)
+        _config = copy.deepcopy(config)
+        _config.head_dim = config.hidden_size // config.num_attention_heads
+        _config.num_hidden_layers = 2
+        self.attention = MistralModel(_config)
         self.embed_tokens = nn.Linear(config.num_local_experts, config.hidden_size, bias=False)
         self.router_out = nn.Linear(config.hidden_size, config.num_local_experts, bias=False)
         self.variational = config.variational
 
-    def forward(self, hidden_states: torch.Tensor, previous_router_logits_list: Optional[List[torch.Tensor]] = None):
+    def forward(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, position_ids: Optional[torch.Tensor] = None, previous_router_logits_list: Optional[List[torch.Tensor]] = None):
         # process previous router logits if provided
         if previous_router_logits_list is not None:
             # embed each previous router logits and append to hidden states
@@ -731,7 +737,7 @@ class AttentionRouter(nn.Module):
                 embedded_logits = self.embed_tokens(prev_logits)  # convert logits to embeddings
                 hidden_states = torch.cat([hidden_states, embedded_logits], dim=1)  # append to sequence
 
-        router_hidden_states, _, _ = self.attention(hidden_states=hidden_states)
+        router_hidden_states = self.attention(inputs_embeds=hidden_states, attention_mask=attention_mask).last_hidden_state
         batch_size, sequence_length, hidden_dim = router_hidden_states.shape
         if self.variational and self.training:
             router_hidden_states = torch.cat([router_hidden_states[:,1:,:], router_hidden_states[:,:1,:]], dim=1)
@@ -1234,7 +1240,7 @@ class MixtralModel(MixtralPreTrainedModel):
 
         # only run global router if `global_routing_logits` not provided
         if self.global_router and global_routing_logits is None:
-            global_routing_logits = self.global_router(hidden_states)
+            global_routing_logits = self.global_router(hidden_states, attention_mask)
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
